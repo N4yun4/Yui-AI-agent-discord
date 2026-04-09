@@ -706,18 +706,34 @@ async def run_action(guild: discord.Guild, action: dict) -> str:
     return "\n".join(results) if results else "✅ Selesai!"
 
 
-async def run_send_message(guild: discord.Guild, channel_name: str, message_text: str) -> str:
-    """Kirim pesan langsung ke channel Discord atas nama Yui."""
-    ch = discord.utils.get(guild.text_channels, name=channel_name)
+async def run_send_message(guild: discord.Guild, channel_ref: str, message_text: str) -> str:
+    """Kirim pesan langsung ke channel Discord atas nama Yui.
+    channel_ref bisa berupa: ID angka, <#id> mention, atau nama channel string.
+    """
+    ch = None
+
+    # 1. Coba parse sebagai ID angka (AI sering kirim ID bukan nama)
+    ref_clean = channel_ref.strip().lstrip("<#").rstrip(">")
+    if ref_clean.isdigit():
+        ch = guild.get_channel(int(ref_clean))
+        # Pastikan itu text channel di guild ini
+        if ch and not isinstance(ch, discord.TextChannel):
+            ch = None
+
+    # 2. Coba cari berdasarkan nama exact
     if not ch:
-        # Coba normalisasi nama: hapus emoji/spasi berlebih, cari partial match
-        norm = channel_name.lower().replace(" ", "-").strip()
+        ch = discord.utils.get(guild.text_channels, name=channel_ref.strip())
+
+    # 3. Partial match (normalisasi nama)
+    if not ch:
+        norm = channel_ref.lower().replace(" ", "-").strip()
         ch = next(
             (c for c in guild.text_channels if norm in c.name.lower()),
             None,
         )
+
     if not ch:
-        return f"⚠️ Channel `{channel_name}` tidak ditemukan di server."
+        return f"⚠️ Channel `{channel_ref}` tidak ditemukan di server."
     try:
         await ch.send(message_text)
         return f"✉️ Pesan terkirim ke {ch.mention}!"
