@@ -1,13 +1,17 @@
 # Yui AI Agent Discord
 
-Bot Discord berbasis AI lokal menggunakan **Ollama** — tanpa API key, tanpa biaya. Bot ini membantu kamu membangun dan mengelola struktur server Discord secara otomatis melalui perintah slash.
+Bot Discord berbasis AI lokal menggunakan **Ollama** — tanpa API key, tanpa biaya. Bot ini memiliki persona **Yui dari Sword Art Online (SAO)**. Yui bisa menemani ngobrol member biasa dengan gaya bahasanya yang imut, dan dapat membantu Admin membangun serta mengelola struktur server Discord secara otomatis melalui chat.
 
-## Fitur
+## Fitur & Slash Commands
 
-- `/ai-build` — Chat dengan AI untuk membuat channel & kategori secara otomatis
+- `/yui-permission` — Lihat info permission Yui di server ini (Hanya Admin)
+- `/ai-build` — Chat dengan AI untuk membuat channel & kategori secara otomatis (Hanya Admin)
 - `/ai-suggest` — Minta saran struktur server untuk jenis komunitas tertentu
-- `/ai-reset` — Reset history percakapan AI
-- `/ollama-status` — Cek apakah Ollama berjalan dan model apa yang tersedia
+- `/ai-audit` — AI audit & evaluasi struktur server (Hanya Admin)
+- `/ai-name` — Generate opsi nama channel kreatif dari AI
+- `/set-chat-channel` — Toggle channel saat ini menjadi tempat chat bebas dengan Yui tanpa menyebut (mention) Yui (Hanya Admin)
+- `/ai-reset` — Reset history percakapan AI kamu
+- `/ollama-status` — Cek status Ollama dan ketersediaan model 
 - `/server-info` — Tampilkan informasi lengkap server
 
 ## Cara Kerja
@@ -18,7 +22,7 @@ Bot mengirim perintah pengguna ke model AI lokal via Ollama API (`/api/chat`). A
 
 - Python 3.10+
 - [Ollama](https://ollama.com) terinstall dan berjalan (`ollama serve`)
-- Model sudah di-pull, contoh: `ollama pull llama3`
+- Model sudah di-pull, direkomendasikan: `ollama pull gemma4`
 - Discord bot token dengan permission **Manage Channels**
 
 ## Instalasi
@@ -43,7 +47,7 @@ Bot mengirim perintah pengguna ke model AI lokal via Ollama API (`/api/chat`). A
    DISCORD_TOKEN=token_bot_discord_kamu
    GUILD_ID=id_server_discord_kamu
    OLLAMA_URL=http://localhost:11434
-   OLLAMA_MODEL=llama3
+   OLLAMA_MODEL=gemma4
    ```
 
 4. Jalankan bot:
@@ -58,7 +62,7 @@ Bot mengirim perintah pengguna ke model AI lokal via Ollama API (`/api/chat`). A
 | `DISCORD_TOKEN` | Token bot Discord | — |
 | `GUILD_ID` | ID server Discord | — |
 | `OLLAMA_URL` | Alamat Ollama lokal | `http://localhost:11434` |
-| `OLLAMA_MODEL` | Model yang digunakan | `llama3` |
+| `OLLAMA_MODEL` | Model yang digunakan | `gemma4` |
 | `COOLDOWN_SECONDS` | Jeda antar perintah (detik) | `3` |
 | `MAX_HISTORY` | Maks riwayat percakapan per user | `20` |
 
