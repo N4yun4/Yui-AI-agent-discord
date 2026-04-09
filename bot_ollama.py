@@ -429,12 +429,56 @@ async def news_search(query: str, max_results: int = 5) -> list[dict]:
                     "title":   html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip(),
                     "url":     raw_url,
                     "snippet": html.unescape(re.sub(r"<[^>]+>", "", raw_snip)).strip(),
+                    "image":   None,  # akan diisi oleh fetch_og_image
                 })
                 if len(results) >= max_results:
                     break
     except Exception:
         pass
     return results
+
+
+async def fetch_og_image(url: str) -> str | None:
+    """
+    Ambil URL gambar Open Graph (og:image) dari sebuah halaman artikel.
+    Return URL gambar string, atau None jika tidak ditemukan / gagal.
+    """
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html",
+        }
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            # Ambil hanya 20KB pertama untuk efisiensi
+            chunk = r.text[:20000]
+        # Cari og:image
+        og_re = re.compile(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            re.IGNORECASE,
+        )
+        m = og_re.search(chunk)
+        if m:
+            img_url = html.unescape(m.group(1).strip())
+            if img_url.startswith("http"):
+                return img_url
+        # Fallback: twitter:image
+        tw_re = re.compile(
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            re.IGNORECASE,
+        )
+        m2 = tw_re.search(chunk)
+        if m2:
+            img_url = html.unescape(m2.group(1).strip())
+            if img_url.startswith("http"):
+                return img_url
+    except Exception:
+        pass
+    return None
+
 
 
 def format_search_results(results: list[dict], query: str) -> str:
@@ -1462,14 +1506,44 @@ async def yui_berita(interaction: discord.Interaction, topik: str):
         await interaction.followup.send(
             f"🌸 Maaf, Yui tidak menemukan berita tentang `{topik}`~ 😭")
         return
-    emb = discord.Embed(title=f"📰 Berita: {topik}", color=0xAFA9EC)
-    emb.set_author(name="🌸 Yui — Berita", icon_url=bot.user.display_avatar.url)
-    for r in results[:5]:
-        snip = r["snippet"][:120] + ("..." if len(r["snippet"]) > 120 else "")
-        url_p = f"\n[Baca]({r['url']})" if r.get("url") else ""
-        emb.add_field(name=r["title"][:80] or "Berita", value=snip + url_p, inline=False)
-    emb.set_footer(text="DuckDuckGo News • 🌸 Yui selalu update untukmu~")
-    await interaction.followup.send(embed=emb)
+
+    # Fetch og:image untuk tiap artikel secara paralel (max 5)
+    img_tasks = [fetch_og_image(r["url"]) for r in results]
+    images    = await asyncio.gather(*img_tasks)
+    for r, img in zip(results, images):
+        r["image"] = img
+
+    # Embed pertama: header ringkasan
+    header_emb = discord.Embed(
+        title=f"📰 Berita Terbaru: {topik}",
+        description=f"🌸 *Yui menemukan **{len(results)}** berita untukmu~*",
+        color=0xAFA9EC,
+    )
+    header_emb.set_author(name="🌸 Yui — Berita", icon_url=bot.user.display_avatar.url)
+    # Pasang gambar dari artikel pertama yang punya gambar sebagai thumbnail header
+    first_img = next((r["image"] for r in results if r.get("image")), None)
+    if first_img:
+        header_emb.set_image(url=first_img)
+    await interaction.followup.send(embed=header_emb)
+
+    # Kirim tiap berita sebagai embed terpisah agar gambar masing-masing tampil
+    for i, r in enumerate(results, 1):
+        snip = r["snippet"][:200] + ("..." if len(r["snippet"]) > 200 else "")
+        url_val = r.get("url", "")
+
+        art_emb = discord.Embed(
+            title=r["title"][:200] or "Berita",
+            url=url_val or None,
+            description=snip,
+            color=0xAFA9EC,
+        )
+        if r.get("image"):
+            art_emb.set_image(url=r["image"])
+        if url_val:
+            art_emb.add_field(name="🔗 Baca selengkapnya", value=f"[Klik di sini]({url_val})", inline=False)
+        art_emb.set_footer(text=f"Berita {i}/{len(results)} • DuckDuckGo News • 🌸")
+        await interaction.followup.send(embed=art_emb)
+
 
 
 @bot.tree.command(name="yui-tanya-web", description="Tanya Yui sesuatu, Yui akan search dulu sebelum menjawab", guild=_guild)
