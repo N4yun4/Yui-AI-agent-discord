@@ -128,6 +128,7 @@ ATURAN FORMAT JSON:
 - create_multiple   : buat beberapa kategori+channel sekaligus
 - delete_channel    : hapus channel berdasarkan nama
 - rename_channel    : rename channel
+- send_message      : kirim pesan teks ke channel tertentu
 
 Contoh format:
 ```json
@@ -144,6 +145,9 @@ Contoh format:
 ```
 ```json
 {"action":"rename_channel","old_name":"nama-lama","new_name":"nama-baru","new_topic":"topik baru (opsional)"}
+```
+```json
+{"action":"send_message","channel":"nama-channel","message":"Isi pesan yang ingin Yui kirim"}
 ```
 """
 
@@ -183,7 +187,7 @@ KEMAMPUAN:
 2. Eksekusi tugas server Discord (buat/hapus/rename channel & kategori)
 
 DETEKSI TUGAS: Jika pesan berisi kata "buat", "buatkan", "bikin", "tambah", "hapus",
-"rename", "ganti nama", "setup", "channel", "kategori", "voice"
+"rename", "ganti nama", "setup", "channel", "kategori", "voice", "kirim pesan", "tolong kirim"
 → sertakan JSON action di responmu + ucapan Yui yang antusias
 
 JIKA TUGAS: ucapan Yui singkat + JSON action dalam blok ```json```
@@ -702,6 +706,28 @@ async def run_action(guild: discord.Guild, action: dict) -> str:
     return "\n".join(results) if results else "✅ Selesai!"
 
 
+async def run_send_message(guild: discord.Guild, channel_name: str, message_text: str) -> str:
+    """Kirim pesan langsung ke channel Discord atas nama Yui."""
+    ch = discord.utils.get(guild.text_channels, name=channel_name)
+    if not ch:
+        # Coba normalisasi nama: hapus emoji/spasi berlebih, cari partial match
+        norm = channel_name.lower().replace(" ", "-").strip()
+        ch = next(
+            (c for c in guild.text_channels if norm in c.name.lower()),
+            None,
+        )
+    if not ch:
+        return f"⚠️ Channel `{channel_name}` tidak ditemukan di server."
+    try:
+        await ch.send(message_text)
+        return f"✉️ Pesan terkirim ke {ch.mention}!"
+    except discord.Forbidden:
+        return f"❌ Yui tidak punya izin menulis di {ch.mention}."
+    except Exception as e:
+        return f"❌ Gagal kirim pesan: {e}"
+
+
+
 async def send_error(target, title: str, desc: str) -> None:
     """Edit placeholder embed dengan pesan error ala Yui."""
     embed = discord.Embed(title=title, description=desc, color=0xF09595)
@@ -755,6 +781,28 @@ async def on_member_join(member: discord.Member) -> None:
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.set_footer(text=f"Member ke-{member.guild.member_count} • Yui selalu di sini untukmu~ 🌸")
         await ch.send(embed=embed)
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
+    """Invalidate snapshot cache saat channel baru dibuat."""
+    invalidate_snapshot_cache(channel.guild.id)
+    print(f"🌸 [Yui] Channel dibuat: #{channel.name} di {channel.guild.name}")
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
+    """Invalidate snapshot cache saat channel dihapus."""
+    invalidate_snapshot_cache(channel.guild.id)
+    print(f"🌸 [Yui] Channel dihapus: #{channel.name} di {channel.guild.name}")
+
+
+@bot.event
+async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel) -> None:
+    """Invalidate snapshot cache saat channel di-rename atau di-edit."""
+    if before.name != after.name:
+        invalidate_snapshot_cache(after.guild.id)
+        print(f"🌸 [Yui] Channel diubah: #{before.name} → #{after.name}")
 
 
 @bot.event
@@ -884,12 +932,15 @@ async def on_message(message: discord.Message) -> None:
         color=0x7EC8E3 if is_browsing else (YUI_COLOR_TASK if is_task else YUI_COLOR),
     ).set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url))
 
-    # Pesan pertama: sertakan snapshot server sebagai konteks (hasil dari cache)
+    # Snapshot server — selalu sertakan konteks terbaru untuk task mode,
+    # atau hanya di pesan pertama untuk chat mode (hemat token)
     enriched = content
-    if not conversation_history.get(uid):
+    is_first_msg = not conversation_history.get(uid)
+    mem_note = f" | Catatan: {mem_u['notes']}" if mem_u.get("notes") else ""
+    if is_first_msg or is_task:
+        # Task mode & pesan pertama: selalu sertakan snapshot terbaru
         snap = server_snapshot(message.guild)
-        mem_note = f" | Catatan: {mem_u['notes']}" if mem_u.get("notes") else ""
-        enriched = f"[Struktur server]\n{snap}\n\n[User: {nickname}{mem_note}]\n\n[Pesan]\n{content}"
+        enriched = f"[Struktur server saat ini]\n{snap}\n\n[User: {nickname}{mem_note}]\n\n[Pesan]\n{content}"
 
     # ── Auto-browsing: inject hasil search / konten URL ke konteks ──
     if url_matches:
@@ -956,8 +1007,16 @@ async def on_message(message: discord.Message) -> None:
             embed.color = YUI_COLOR  # member biasa — abaikan action
         else:
             try:
-                result = await run_action(message.guild, action)
-                invalidate_snapshot_cache(message.guild.id)  # refresh cache setelah perubahan
+                # Tangani send_message secara khusus
+                if action.get("action") == "send_message":
+                    result = await run_send_message(
+                        message.guild,
+                        action.get("channel", ""),
+                        action.get("message", ""),
+                    )
+                else:
+                    result = await run_action(message.guild, action)
+                    invalidate_snapshot_cache(message.guild.id)  # refresh cache setelah perubahan
                 embed.add_field(name="🌸 Yui berhasil!", value=result, inline=False)
                 embed.color = discord.Color.green()
             except discord.Forbidden:
