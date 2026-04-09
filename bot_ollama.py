@@ -1099,6 +1099,84 @@ async def ai_reset(interaction: discord.Interaction):
     await interaction.response.send_message("🌸 *Yui mengedipkan mata* Baik! Yui akan melupakan percakapan kita sebelumnya~ Hehe", ephemeral=True)
 
 
+# ── Yui Say / Embed — Tangan Yui untuk Menulis Pesan ──────────
+@bot.tree.command(name="yui-say",
+                  description="Suruh Yui mengirim pesan teks ke channel ini (atau channel lain)",
+                  guild=_guild)
+@app_commands.describe(
+    pesan="Pesan yang akan dikirim Yui",
+    channel="Channel tujuan (kosongkan = channel ini)",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def yui_say(
+    interaction: discord.Interaction,
+    pesan: str,
+    channel: discord.TextChannel | None = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+
+    target = channel or interaction.channel
+    try:
+        await target.send(pesan)
+        await interaction.response.send_message(
+            f"✅ Pesan sudah Yui kirim ke {target.mention}~ 🌸", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Yui tidak punya izin mengirim pesan di {target.mention}~ 😢", ephemeral=True)
+
+
+@bot.tree.command(name="yui-embed",
+                  description="Suruh Yui mengirim pesan dalam embed cantik ke channel ini (atau channel lain)",
+                  guild=_guild)
+@app_commands.describe(
+    pesan="Isi pesan embed",
+    judul="Judul embed (opsional)",
+    channel="Channel tujuan (kosongkan = channel ini)",
+    warna="Warna embed: pink / ungu / hijau / biru / merah (default: pink)",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def yui_embed(
+    interaction: discord.Interaction,
+    pesan: str,
+    judul: str = "",
+    channel: discord.TextChannel | None = None,
+    warna: str = "pink",
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+
+    color_map = {
+        "pink":  YUI_COLOR,
+        "ungu":  YUI_COLOR_TASK,
+        "hijau": discord.Color.green().value,
+        "biru":  0x7EC8E3,
+        "merah": 0xF09595,
+    }
+    embed_color = color_map.get(warna.lower(), YUI_COLOR)
+
+    embed = discord.Embed(
+        title=judul or None,
+        description=pesan,
+        color=embed_color,
+    )
+    embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+
+    target = channel or interaction.channel
+    try:
+        await target.send(embed=embed)
+        await interaction.response.send_message(
+            f"✅ Embed sudah Yui kirim ke {target.mention}~ 🌸", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"❌ Yui tidak punya izin mengirim pesan di {target.mention}~ 😢", ephemeral=True)
+
+
+
 @bot.tree.command(name="ollama-status", description="Cek status Ollama dan model tersedia", guild=_guild)
 async def ollama_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
