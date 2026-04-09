@@ -534,13 +534,20 @@ async def extract_images(message: discord.Message) -> list[dict]:
 #  Helpers
 # ─────────────────────────────────────────────
 def extract_json(text: str) -> dict | None:
-    """Ekstrak blok ```json``` pertama dari teks AI."""
+    """Ekstrak blok ```json``` pertama dari teks AI.
+    Jika AI mengembalikan JSON array ([{...}]), ambil elemen pertama yang merupakan dict.
+    """
     m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if m:
         try:
-            return json.loads(m.group(1))
+            parsed = json.loads(m.group(1))
+            if isinstance(parsed, list):
+                # AI kadang bungkus action dalam array — ambil item dict pertama
+                parsed = next((item for item in parsed if isinstance(item, dict)), None)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
-            return None
+            pass
     return None
 
 
@@ -591,6 +598,9 @@ def add_to_history(user_id: int, role: str, content: str) -> None:
 
 async def run_action(guild: discord.Guild, action: dict) -> str:
     """Eksekusi JSON action dari AI ke Discord API."""
+    # Guard: pastikan action adalah dict (AI bisa saja kembalikan list/None)
+    if not isinstance(action, dict):
+        return "⚠️ Format action dari AI tidak valid."
     results: list[str] = []
 
     async def get_or_make_cat(name: str) -> discord.CategoryChannel:
