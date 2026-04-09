@@ -45,8 +45,8 @@ SEARCH_TRIGGER_KEYWORDS = {
 # Pola deteksi URL dalam pesan
 _URL_RE = re.compile(r"https?://\S+")
 
-# State in-memory
-conversation_history: dict[int, list[dict]]  = {}
+# State in-memory (conversation_history akan di-load dari file setelah helper tersedia)
+conversation_history: dict[int, list[dict]]  = {}  # diisi ulang di bawah setelah _load_history
 user_last_msg:        dict[int, float]       = {}
 _server_snapshot_cache: dict[int, tuple[float, str]] = {}  # guild_id → (timestamp, snapshot)
 SNAPSHOT_TTL = 300  # cache snapshot selama 5 menit
@@ -56,6 +56,7 @@ MEMORY_FILE        = pathlib.Path("yui_memory.json")
 BANNED_WORDS_FILE  = pathlib.Path("banned_words.json")
 CHAT_CHANNELS_FILE = pathlib.Path("chat_channels.json")
 WARN_COUNT_FILE    = pathlib.Path("warn_count.json")
+HISTORY_FILE       = pathlib.Path("yui_history.json")  # persistent conversation history
 
 def _load_json(p, default):
     if p.exists():
@@ -70,11 +71,37 @@ def _save_json(p, data):
     p.write_text(json.dumps(sorted(data) if isinstance(data, set) else data,
                              ensure_ascii=False, indent=2), encoding="utf-8")
 
+# ── Persistent history helpers ──
+def _load_history() -> dict:
+    """Muat semua conversation history dari file. Keys adalah string user_id."""
+    if HISTORY_FILE.exists():
+        try:
+            raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                # Konversi key string → int, dan trim tiap history ke MAX_HISTORY
+                return {int(k): v[-MAX_HISTORY:] for k, v in raw.items() if isinstance(v, list)}
+        except Exception:
+            pass
+    return {}
+
+def _save_history() -> None:
+    """Simpan semua conversation history ke file (keys → string untuk JSON)."""
+    try:
+        data = {str(k): v for k, v in conversation_history.items()}
+        HISTORY_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 user_memory:      dict = _load_json(MEMORY_FILE, {})
 banned_words:     set  = _load_json(BANNED_WORDS_FILE, set())
 chat_channel_ids: set  = _load_json(CHAT_CHANNELS_FILE, set())
 warn_count:       dict = _load_json(WARN_COUNT_FILE, {})
 msg_stats:        dict = {}
+
+# Muat persistent history setelah semua helper tersedia
+conversation_history.update(_load_history())
+print(f"📚 History dimuat: {len(conversation_history)} user dari {HISTORY_FILE}")
+
 
 # ─────────────────────────────────────────────
 #  Permission System
@@ -590,13 +617,32 @@ def extract_json(text: str) -> dict | None:
         try:
             parsed = json.loads(m.group(1))
             if isinstance(parsed, list):
-                # AI kadang bungkus action dalam array — ambil item dict pertama
                 parsed = next((item for item in parsed if isinstance(item, dict)), None)
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
             pass
     return None
+
+
+def extract_all_json(text: str) -> list[dict]:
+    """Ekstrak SEMUA blok ```json``` dari teks AI.
+    Return list of dicts (hanya yang valid dan berupa dict).
+    Mendukung AI yang mengembalikan array maupun object per blok.
+    """
+    actions: list[dict] = []
+    for m in re.finditer(r"```json\s*(.*?)\s*```", text, re.DOTALL):
+        try:
+            parsed = json.loads(m.group(1))
+            if isinstance(parsed, dict):
+                actions.append(parsed)
+            elif isinstance(parsed, list):
+                # Array of actions dari satu blok
+                actions.extend(item for item in parsed if isinstance(item, dict))
+        except json.JSONDecodeError:
+            continue
+    return actions
+
 
 
 def strip_json_block(text: str) -> str:
@@ -635,13 +681,14 @@ def invalidate_snapshot_cache(guild_id: int) -> None:
 
 
 def add_to_history(user_id: int, role: str, content: str) -> None:
-    """Tambah pesan ke history, buang yang paling lama jika melebihi MAX_HISTORY."""
+    """Tambah pesan ke history, buang yang paling lama jika melebihi MAX_HISTORY, lalu simpan."""
     hist = conversation_history.setdefault(user_id, [])
     hist.append({"role": role, "content": content})
     if len(hist) > MAX_HISTORY:
         # Pertahankan konteks server di pesan pertama jika ada
         first = hist[0]
         conversation_history[user_id] = [first] + hist[-(MAX_HISTORY - 1):]
+    _save_history()  # simpan ke file setiap ada perubahan
 
 
 async def run_action(guild: discord.Guild, action: dict) -> str:
@@ -1010,37 +1057,43 @@ async def on_message(message: discord.Message) -> None:
 
     add_to_history(uid, "assistant", ai_text)
 
-    action  = extract_json(ai_text)
+    actions = extract_all_json(ai_text)  # ambil SEMUA JSON action
     display = strip_json_block(ai_text)[:1900] or "..."
 
-    yui_color = YUI_COLOR_TASK if (action or is_task) else YUI_COLOR
+    has_action = bool(actions)
+    yui_color = YUI_COLOR_TASK if (has_action or is_task) else YUI_COLOR
     embed = discord.Embed(description=display, color=yui_color)
     embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
     embed.set_footer(text=f"Yui • {mode_label}{mode_suffix} • reply atau sebut nama Yui untuk lanjut~")
 
-    if action:
+    if actions:
         if not admin:
-            embed.color = YUI_COLOR  # member biasa — abaikan action
+            embed.color = YUI_COLOR  # member biasa — abaikan semua action
         else:
-            try:
-                # Tangani send_message secara khusus
-                if action.get("action") == "send_message":
-                    result = await run_send_message(
-                        message.guild,
-                        action.get("channel", ""),
-                        action.get("message", ""),
-                    )
-                else:
-                    result = await run_action(message.guild, action)
-                    invalidate_snapshot_cache(message.guild.id)  # refresh cache setelah perubahan
-                embed.add_field(name="🌸 Yui berhasil!", value=result, inline=False)
-                embed.color = discord.Color.green()
-            except discord.Forbidden:
-                embed.add_field(name="❌ Forbidden", value="Bot butuh izin **Manage Channels**.", inline=False)
-                embed.color = discord.Color.red()
-            except Exception as e:
-                embed.add_field(name="❌ Error", value=str(e), inline=False)
-                embed.color = discord.Color.red()
+            all_results: list[str] = []
+            need_cache_invalidate = False
+            for action in actions:
+                try:
+                    if action.get("action") == "send_message":
+                        res = await run_send_message(
+                            message.guild,
+                            action.get("channel", ""),
+                            action.get("message", ""),
+                        )
+                    else:
+                        res = await run_action(message.guild, action)
+                        need_cache_invalidate = True
+                    all_results.append(res)
+                except discord.Forbidden:
+                    all_results.append("❌ Butuh izin **Manage Channels**.")
+                except Exception as e:
+                    all_results.append(f"❌ Error: {e}")
+            if need_cache_invalidate:
+                invalidate_snapshot_cache(message.guild.id)
+            result_text = "\n".join(all_results)
+            embed.add_field(name=f"🌸 Yui — {len(actions)} aksi selesai", value=result_text[:1020], inline=False)
+            embed.color = discord.Color.green()
+
 
     await placeholder.edit(embed=embed)
 
@@ -1215,6 +1268,7 @@ async def set_chat_channel(interaction: discord.Interaction):
 @bot.tree.command(name="ai-reset", description="Reset history percakapan AI kamu", guild=_guild)
 async def ai_reset(interaction: discord.Interaction):
     conversation_history.pop(interaction.user.id, None)
+    _save_history()  # hapus dari file juga
     await interaction.response.send_message("🌸 *Yui mengedipkan mata* Baik! Yui akan melupakan percakapan kita sebelumnya~ Hehe", ephemeral=True)
 
 
