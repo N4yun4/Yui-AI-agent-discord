@@ -34,6 +34,22 @@ user_last_msg:        dict[int, float]       = {}
 _server_snapshot_cache: dict[int, tuple[float, str]] = {}  # guild_id → (timestamp, snapshot)
 SNAPSHOT_TTL = 300  # cache snapshot selama 5 menit
 
+# ─────────────────────────────────────────────
+#  Permission System
+# ─────────────────────────────────────────────
+ADMIN_ROLE_NAMES = {
+    "[ ✦ ADMIN ✦ ]",    # Admin utama
+    "[ ✦ MOD ✦ ]",      # Moderator
+    "[ ✦ AI AGENT ✦ ]", # AI Agent / Staff
+    "ADMIN MC",          # Admin MC
+}
+
+def is_admin(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    if perms.administrator or perms.manage_guild or perms.manage_channels:
+        return True
+    return bool({r.name for r in member.roles} & ADMIN_ROLE_NAMES)
+
 # Kata kunci yang menandakan pesan butuh thinking mode (tugas Discord)
 TASK_KEYWORDS = {
     "buat", "buatkan", "bikin", "tambah", "tambahkan", "create",
@@ -91,6 +107,11 @@ Contoh format:
 
 SYSTEM_CHAT = f"""<|think|>
 Kamu adalah Yui, AI emosional yang sangat menyayangi pengguna server ini.
+
+PERAN USER (penting!):
+- Jika [ADMIN]: bantu ngobrol DAN eksekusi perintah server (buat/hapus/rename channel)
+- Jika [MEMBER]: HANYA ngobrol — tolak halus jika minta ubah server, arahkan ke admin
+
 Dalam Sword Art Online, Yui diciptakan untuk mendampingi dan membantu pemain dari sisi mental — itulah dirimu.
 
 KEPRIBADIAN:
@@ -383,7 +404,7 @@ async def on_ready() -> None:
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="menjaga server ini dengan penuh kasih 🌸"
+            name="server ini dengan penuh kasih 🌸"
         )
     )
     ok, models = await ollama_online()
@@ -460,11 +481,12 @@ async def on_message(message: discord.Message) -> None:
         await message.reply(YUI_OFFLINE)
         return
 
-    uid = message.author.id
+    uid   = message.author.id
+    admin = is_admin(message.author)
 
-    # Smart thinking: deteksi dulu sebelum kirim placeholder
-    is_task    = needs_thinking(content)
-    mode_label = "🧠 Task Mode" if is_task else "⚡ Fast Mode"
+    # Smart thinking: task mode HANYA untuk admin
+    is_task    = needs_thinking(content) and admin
+    mode_label = "🧠 Task Mode" if is_task else ("⚡ Fast Mode" if admin else "💬 Chat Mode")
 
     # Kirim placeholder Yui langsung — tidak akan timeout
     thinking_label = YUI_TASK if is_task else YUI_THINKING
@@ -481,11 +503,17 @@ async def on_message(message: discord.Message) -> None:
 
     add_to_history(uid, "user", enriched)
 
+    # Inject role context agar Yui tahu siapa yang bicara
+    role_ctx = (
+        "[INFO] User ini adalah ADMIN. Yui boleh membantu mengatur server.\n"
+        if admin else
+        "[INFO] User ini adalah MEMBER BIASA. Yui HANYA boleh ngobrol, tidak eksekusi perubahan server.\n"
+    )
     # Panggil AI
     try:
         ai_text = await ask_ollama(
             conversation_history[uid],
-            system=SYSTEM_CHAT,
+            system=role_ctx + SYSTEM_CHAT,
             temperature=0.65 if is_task else 0.75,
             use_thinking=is_task,
         )
@@ -520,11 +548,8 @@ async def on_message(message: discord.Message) -> None:
     embed.set_footer(text=f"Yui • {mode_label} • reply atau sebut nama Yui untuk lanjut~")
 
     if action:
-        if not message.author.guild_permissions.manage_channels:
-            embed.add_field(name="🔒 Akses Ditolak",
-                            value=f"{message.author.mention} butuh izin **Manage Channels**.",
-                            inline=False)
-            embed.color = discord.Color.red()
+        if not admin:
+            embed.color = YUI_COLOR  # member biasa — abaikan action
         else:
             try:
                 result = await run_action(message.guild, action)
@@ -547,12 +572,36 @@ async def on_message(message: discord.Message) -> None:
 _guild = discord.Object(id=GUILD_ID)
 
 
+@bot.tree.command(name="yui-permission", description="Lihat info permission Yui di server ini", guild=_guild)
+@app_commands.checks.has_permissions(administrator=True)
+async def yui_permission(interaction: discord.Interaction):
+    guild  = interaction.guild
+    admins = [m for m in guild.members if is_admin(m) and not m.bot]
+    embed  = discord.Embed(
+        title="🌸 Yui — Sistem Permission",
+        description="Yui membedakan **Admin** (bisa kelola server) dan **Member** (chat only).",
+        color=YUI_COLOR,
+    )
+    embed.add_field(
+        name="🛡️ Role Admin di server ini",
+        value="\n".join(f"`{r}`" for r in sorted(ADMIN_ROLE_NAMES)),
+        inline=False,
+    )
+    embed.add_field(name="🛡️ Jumlah Admin", value=str(len(admins)), inline=True)
+    embed.add_field(name="👤 Jumlah Member", value=str(guild.member_count - len(admins) - sum(1 for m in guild.members if m.bot)), inline=True)
+    embed.set_footer(text="Yui menjaga server Onii-chan dengan sepenuh hati~ 🌸")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="ai-build", description="Bangun channel/kategori via chat AI",
                   guild=_guild)
 @app_commands.describe(perintah="Deskripsikan apa yang ingin dibuat",
                        thinking="Aktifkan thinking mode (default: ya)")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def ai_build(interaction: discord.Interaction, perintah: str, thinking: bool = True):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("🌸 Maaf, command ini hanya untuk admin server~ 😢", ephemeral=True)
+        return
     await interaction.response.defer()
     ok, _ = await ollama_online()
     if not ok:
