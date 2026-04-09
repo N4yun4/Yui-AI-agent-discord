@@ -1,8 +1,14 @@
 import asyncio
+import base64
+import collections
+import html
 import json
 import os
+import pathlib
+import random
 import re
 import time
+import urllib.parse
 
 import discord
 import httpx
@@ -24,15 +30,51 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID     = int(os.getenv("GUILD_ID", "0"))
 OLLAMA_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4")
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SECONDS", "3"))
-MAX_HISTORY  = int(os.getenv("MAX_HISTORY", "20"))
+COOLDOWN_SEC        = int(os.getenv("COOLDOWN_SECONDS", "3"))
+MAX_HISTORY         = int(os.getenv("MAX_HISTORY", "20"))
+WELCOME_CHANNEL     = os.getenv("WELCOME_CHANNEL", "👋・welcome")
+SEARCH_MAX_RESULTS  = int(os.getenv("SEARCH_MAX_RESULTS", "4"))
+
+# Kata kunci yang memicu web search otomatis
+SEARCH_TRIGGER_KEYWORDS = {
+    "cari", "carikan", "search", "googling", "browsing", "browse",
+    "terbaru", "terkini", "berita", "news", "harga", "cuaca", "weather",
+    "hari ini", "sekarang", "update", "info terbaru",
+}
+
+# Pola deteksi URL dalam pesan
+_URL_RE = re.compile(r"https?://\S+")
 
 # State in-memory
 conversation_history: dict[int, list[dict]]  = {}
-chat_channel_ids:     set[int]               = set()
 user_last_msg:        dict[int, float]       = {}
 _server_snapshot_cache: dict[int, tuple[float, str]] = {}  # guild_id → (timestamp, snapshot)
 SNAPSHOT_TTL = 300  # cache snapshot selama 5 menit
+
+# ── Persistent files ──
+MEMORY_FILE        = pathlib.Path("yui_memory.json")
+BANNED_WORDS_FILE  = pathlib.Path("banned_words.json")
+CHAT_CHANNELS_FILE = pathlib.Path("chat_channels.json")
+WARN_COUNT_FILE    = pathlib.Path("warn_count.json")
+
+def _load_json(p, default):
+    if p.exists():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return set(raw) if isinstance(default, set) else type(default)(raw)
+        except Exception:
+            pass
+    return default
+
+def _save_json(p, data):
+    p.write_text(json.dumps(sorted(data) if isinstance(data, set) else data,
+                             ensure_ascii=False, indent=2), encoding="utf-8")
+
+user_memory:      dict = _load_json(MEMORY_FILE, {})
+banned_words:     set  = _load_json(BANNED_WORDS_FILE, set())
+chat_channel_ids: set  = _load_json(CHAT_CHANNELS_FILE, set())
+warn_count:       dict = _load_json(WARN_COUNT_FILE, {})
+msg_stats:        dict = {}
 
 # ─────────────────────────────────────────────
 #  Permission System
@@ -112,6 +154,12 @@ PERAN USER (penting!):
 - Jika [ADMIN]: bantu ngobrol DAN eksekusi perintah server (buat/hapus/rename channel)
 - Jika [MEMBER]: HANYA ngobrol — tolak halus jika minta ubah server, arahkan ke admin
 
+KEMAMPUAN TAMBAHAN:
+- Kamu bisa MELIHAT gambar yang dikirim user! Jika ada gambar, deskripsikan, komentari,
+  atau jawab pertanyaan tentang gambar tersebut dengan gaya Yui yang hangat dan antusias.
+- Kamu bisa BROWSING INTERNET! Jika ada [Hasil search] atau [Konten dari URL] di konteks,
+  gunakan informasi tersebut untuk menjawab. Sebutkan sumber URL jika relevan.
+
 Dalam Sword Art Online, Yui diciptakan untuk mendampingi dan membantu pemain dari sisi mental — itulah dirimu.
 
 KEPRIBADIAN:
@@ -181,11 +229,13 @@ async def ask_ollama(
     temperature: float = 0.7,
     top_p: float = 0.95,
     use_thinking: bool = False,
+    images: list[dict] | None = None,
 ) -> str:
     """
     Kirim request ke Ollama dengan streaming + auto-retry (3x, exponential backoff).
     - use_thinking=True  → thinking mode ON, num_ctx=4096 (tugas kompleks)
     - use_thinking=False → thinking mode OFF, num_ctx=2048 (chat biasa, lebih cepat)
+    - images: list of {data: base64, mime_type: str} untuk multimodal (Gemma 4)
     """
     MAX_RETRIES  = 3
     RETRY_DELAYS = [3, 6, 12]
@@ -196,7 +246,16 @@ async def ask_ollama(
     all_messages: list[dict] = []
     if effective_system:
         all_messages.append({"role": "system", "content": effective_system})
-    all_messages.extend(messages)
+
+    # Inject gambar ke pesan terakhir jika ada
+    if images and messages:
+        msgs_copy = list(messages)
+        last = dict(msgs_copy[-1])
+        last["images"] = [img["data"] for img in images]  # Ollama terima base64 list
+        msgs_copy[-1] = last
+        all_messages.extend(msgs_copy)
+    else:
+        all_messages.extend(messages)
 
     # num_ctx adaptif: lebih kecil = lebih cepat untuk chat biasa
     num_ctx = 4096 if use_thinking else 2048
@@ -241,7 +300,7 @@ async def ask_ollama(
                             continue
 
             # Bersihkan thinking tokens Gemma 4
-            cleaned = re.sub(r"<\|channel\>thought.*?<channel\|>", "", raw, flags=re.DOTALL)
+            cleaned = re.sub(r"<\|thought\|>.*?<\|/thought\|>", "", raw, flags=re.DOTALL)
             cleaned = re.sub(r"<\|think\|>.*?<\|/think\|>", "", cleaned, flags=re.DOTALL)
             return cleaned.strip()
 
@@ -268,6 +327,207 @@ async def ollama_online() -> tuple[bool, list[str]]:
             return True, models
     except Exception:
         return False, []
+
+
+
+
+# ─────────────────────────────────────────────
+#  Web Search — DuckDuckGo (gratis, tanpa API key)
+# ─────────────────────────────────────────────
+async def web_search(query: str, max_results: int = 5) -> list[dict]:
+    """
+    Cari di internet menggunakan DuckDuckGo HTML scraping.
+    Return list of {title, url, snippet}.
+    Fallback ke DuckDuckGo Instant Answer API jika scraping gagal.
+    """
+    results = []
+
+    # Method 1: DuckDuckGo HTML (paling lengkap)
+    try:
+        encoded = urllib.parse.urlencode({"q": query, "kl": "id-id"})
+        url     = f"https://html.duckduckgo.com/html/?{encoded}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
+        }
+        async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            # Parse hasil dengan regex sederhana (tanpa beautifulsoup)
+            snippet_re = re.compile(
+                r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
+                r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+                re.DOTALL,
+            )
+            for m in snippet_re.finditer(r.text):
+                raw_url, raw_title, raw_snip = m.group(1), m.group(2), m.group(3)
+                # Unwrap DuckDuckGo redirect URL
+                if "uddg=" in raw_url:
+                    real = urllib.parse.parse_qs(urllib.parse.urlparse(raw_url).query).get("uddg", [raw_url])
+                    raw_url = urllib.parse.unquote(real[0])
+                results.append({
+                    "title":   html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip(),
+                    "url":     raw_url,
+                    "snippet": html.unescape(re.sub(r"<[^>]+>", "", raw_snip)).strip(),
+                })
+                if len(results) >= max_results:
+                    break
+    except Exception:
+        pass
+
+    # Method 2: DuckDuckGo Instant Answer API (fallback, lebih terbatas)
+    if not results:
+        try:
+            params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get("https://api.duckduckgo.com/", params=params)
+                d = r.json()
+            if not isinstance(d, dict):
+                d = {}
+            # AbstractText = penjelasan singkat
+            if d.get("AbstractText"):
+                results.append({
+                    "title":   d.get("Heading", query),
+                    "url":     d.get("AbstractURL", ""),
+                    "snippet": d["AbstractText"][:300],
+                })
+            # RelatedTopics
+            for topic in d.get("RelatedTopics", [])[:max_results - len(results)]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append({
+                        "title":   topic.get("Text", "")[:60],
+                        "url":     topic.get("FirstURL", ""),
+                        "snippet": topic.get("Text", "")[:200],
+                    })
+        except Exception:
+            pass
+
+    return results
+
+
+async def news_search(query: str, max_results: int = 5) -> list[dict]:
+    """Cari berita terbaru via DuckDuckGo News."""
+    results = []
+    try:
+        encoded = urllib.parse.urlencode({"q": query, "iar": "news", "ia": "news"})
+        url     = f"https://html.duckduckgo.com/html/?{encoded}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            news_re = re.compile(
+                r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
+                r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+                re.DOTALL,
+            )
+            for m in news_re.finditer(r.text):
+                raw_url, raw_title, raw_snip = m.group(1), m.group(2), m.group(3)
+                if "uddg=" in raw_url:
+                    real = urllib.parse.parse_qs(urllib.parse.urlparse(raw_url).query).get("uddg", [raw_url])
+                    raw_url = urllib.parse.unquote(real[0])
+                results.append({
+                    "title":   html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip(),
+                    "url":     raw_url,
+                    "snippet": html.unescape(re.sub(r"<[^>]+>", "", raw_snip)).strip(),
+                })
+                if len(results) >= max_results:
+                    break
+    except Exception:
+        pass
+    return results
+
+
+def format_search_results(results: list[dict], query: str) -> str:
+    """Format hasil search untuk dikirim ke Gemma 4 sebagai konteks."""
+    if not results:
+        return f"[Tidak ada hasil search untuk: {query}]"
+    lines = [f"[Hasil search untuk: {query}]"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r['title']}")
+        lines.append(f"   URL: {r['url']}")
+        lines.append(f"   {r['snippet']}")
+    return "\n".join(lines)
+
+
+async def fetch_url_text(url: str, max_chars: int = 2500) -> str:
+    """
+    Fetch konten dari URL dan ekstrak teks bersih (tanpa tag HTML).
+    Return string teks atau pesan error.
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            ct = r.headers.get("content-type", "")
+            if "text/html" not in ct:
+                return f"[Konten bukan HTML: {ct}]"
+            text = r.text
+            # Hapus script, style, dan tag HTML
+            text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = html.unescape(text)
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:max_chars]
+    except httpx.TimeoutException:
+        return "[Gagal mengakses URL: timeout]"
+    except Exception as e:
+        return f"[Gagal mengakses URL: {e}]"
+
+
+def needs_web_search(text: str) -> bool:
+    """Deteksi apakah pesan membutuhkan pencarian internet."""
+    words = set(text.lower().split())
+    return bool(words & SEARCH_TRIGGER_KEYWORDS)
+
+
+# ─────────────────────────────────────────────
+#  Image Helper
+# ─────────────────────────────────────────────
+async def fetch_image_b64(url: str) -> tuple[str, str] | None:
+    """Download gambar dari URL Discord dan encode ke base64.
+    Return (base64_string, mime_type) atau None jika gagal.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            ct = r.headers.get("content-type", "image/png").split(";")[0].strip()
+            # Hanya accept format gambar yang didukung Gemma 4
+            if not ct.startswith("image/"):
+                return None
+            b64 = base64.b64encode(r.content).decode("utf-8")
+            return b64, ct
+    except Exception:
+        return None
+
+
+async def extract_images(message: discord.Message) -> list[dict]:
+    """Ekstrak semua gambar dari attachments dan embed pesan Discord.
+    Return list of Ollama image dicts siap kirim ke API.
+    """
+    images = []
+    # Dari attachments langsung
+    for att in message.attachments:
+        if att.content_type and att.content_type.startswith("image/"):
+            result = await fetch_image_b64(att.url)
+            if result:
+                b64, mime = result
+                images.append({"data": b64, "mime_type": mime})
+    # Dari embed (link gambar yang di-share)
+    for emb in message.embeds:
+        if emb.image and emb.image.url:
+            result = await fetch_image_b64(emb.image.url)
+            if result:
+                b64, mime = result
+                images.append({"data": b64, "mime_type": mime})
+        if emb.thumbnail and emb.thumbnail.url and not emb.image:
+            result = await fetch_image_b64(emb.thumbnail.url)
+            if result:
+                b64, mime = result
+                images.append({"data": b64, "mime_type": mime})
+    return images[:4]  # max 4 gambar per pesan (Gemma 4 limit)
 
 
 # ─────────────────────────────────────────────
@@ -411,8 +671,8 @@ async def on_ready() -> None:
     if ok:
         gemma = [m for m in models if "gemma" in m.lower()]
         print(f"✅ Ollama online | Gemma models: {', '.join(gemma) or 'tidak ada'}")
-        if not any("gemma4" in m for m in models):
-            print("⚠️  Jalankan: ollama pull gemma4")
+        if not any(OLLAMA_MODEL in m for m in models):
+            print(f"⚠️  Jalankan: ollama pull {OLLAMA_MODEL}")
     else:
         print("❌ Ollama offline — jalankan: ollama serve")
     try:
@@ -425,7 +685,7 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    ch = discord.utils.get(member.guild.text_channels, name="👋・welcome")
+    ch = discord.utils.get(member.guild.text_channels, name=WELCOME_CHANNEL)
     if ch:
         embed = discord.Embed(
             title=f"🌸 Yui menyambut {member.display_name}~!",
@@ -465,9 +725,53 @@ async def on_message(message: discord.Message) -> None:
         content = content.replace(f"<@{u.id}>", "").replace(f"<@!{u.id}>", "")
     content = content.strip()
 
-    if not content:
+    # ── Track stats ──
+    gid = message.guild.id
+    if gid not in msg_stats:
+        msg_stats[gid] = {"total": 0, "ch": collections.Counter(),
+                          "usr": collections.Counter(), "hr": collections.Counter()}
+    msg_stats[gid]["total"] += 1
+    msg_stats[gid]["ch"][message.channel.name] += 1
+    msg_stats[gid]["usr"][message.author.display_name] += 1
+    msg_stats[gid]["hr"][time.localtime().tm_hour] += 1
+
+    # ── Auto-mod: cek kata terlarang ──
+    if banned_words and not is_admin(message.author):
+        low = message.content.lower()
+        hit = next((w for w in banned_words if w in low), None)
+        if hit:
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            uid_w = str(message.author.id)
+            warn_count[uid_w] = warn_count.get(uid_w, 0) + 1
+            _save_json(WARN_COUNT_FILE, warn_count)
+            wc = warn_count[uid_w]
+            lines = [
+                f"*Yui mengedipkan mata khawatir* {message.author.mention}...",
+                "Pesan kamu mengandung kata yang tidak boleh dipakai di sini ne~ 🌸",
+                f"Peringatan ke-**{wc}** — tolong jaga sopan santun ya!",
+            ]
+            emb = discord.Embed(description="\n".join(lines), color=0xF09595)
+            emb.set_author(name="🌸 Yui — Peringatan", icon_url=bot.user.display_avatar.url)
+            if wc >= 3:
+                emb.add_field(name="⚠️ Perhatian Admin",
+                              value=f"{message.author.mention} sudah **{wc} peringatan**!", inline=False)
+            await message.channel.send(embed=emb, delete_after=15)
+            return
+
+    # Boleh kosong teks asal ada gambar
+    has_images = any(
+        att.content_type and att.content_type.startswith("image/")
+        for att in message.attachments
+    ) or any(emb.image or emb.thumbnail for emb in message.embeds)
+
+    if not content and not has_images:
         await message.reply(YUI_EMPTY_MSG)
         return
+    if not content and has_images:
+        content = "Tolong lihat dan deskripsikan gambar ini~" 
 
     # Cooldown
     now = time.time()
@@ -483,31 +787,76 @@ async def on_message(message: discord.Message) -> None:
 
     uid   = message.author.id
     admin = is_admin(message.author)
+    mem_u = user_memory.get(str(uid), {})
+    nickname = mem_u.get("nickname", message.author.display_name)
+
+    # Ekstrak gambar dari pesan (jika ada)
+    images = await extract_images(message) if has_images else []
+    if images:
+        img_note = f"📸 {len(images)} gambar"
+        mode_suffix = f" • {img_note}"
+    else:
+        img_note = ""
+        mode_suffix = "" 
 
     # Smart thinking: task mode HANYA untuk admin
     is_task    = needs_thinking(content) and admin
-    mode_label = "🧠 Task Mode" if is_task else ("⚡ Fast Mode" if admin else "💬 Chat Mode")
+
+    # Deteksi kebutuhan browsing (URL atau kata trigger search)
+    url_matches    = _URL_RE.findall(content) if content else []
+    need_search    = needs_web_search(content) and not url_matches
+    is_browsing    = bool(url_matches) or need_search
+
+    if is_browsing:
+        mode_label = "🌐 Browse Mode"
+    elif is_task:
+        mode_label = "🧠 Task Mode"
+    elif admin:
+        mode_label = "⚡ Fast Mode"
+    else:
+        mode_label = "💬 Chat Mode"
 
     # Kirim placeholder Yui langsung — tidak akan timeout
-    thinking_label = YUI_TASK if is_task else YUI_THINKING
+    if url_matches:
+        thinking_label = "🌐 *Yui sedang membaca halaman itu...* 🔍"
+    elif need_search:
+        thinking_label = "🔍 *Yui sedang mencari di internet...* 🌐"
+    elif images:
+        thinking_label = f"🖼️ *Yui sedang melihat gambarnya...* {img_note}"
+    else:
+        thinking_label = YUI_TASK if is_task else YUI_THINKING
     placeholder = await message.reply(embed=discord.Embed(
         description=thinking_label,
-        color=YUI_COLOR_TASK if is_task else YUI_COLOR,
+        color=0x7EC8E3 if is_browsing else (YUI_COLOR_TASK if is_task else YUI_COLOR),
     ).set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url))
 
     # Pesan pertama: sertakan snapshot server sebagai konteks (hasil dari cache)
     enriched = content
     if not conversation_history.get(uid):
         snap = server_snapshot(message.guild)
-        enriched = f"[Struktur server saat ini]\n{snap}\n\n[Pesan]\n{content}"
+        mem_note = f" | Catatan: {mem_u['notes']}" if mem_u.get("notes") else ""
+        enriched = f"[Struktur server]\n{snap}\n\n[User: {nickname}{mem_note}]\n\n[Pesan]\n{content}"
+
+    # ── Auto-browsing: inject hasil search / konten URL ke konteks ──
+    if url_matches:
+        # Fetch konten URL pertama yang ditemukan
+        url_text = await fetch_url_text(url_matches[0])
+        enriched += f"\n\n[Konten dari {url_matches[0]}]\n{url_text}"
+        mode_suffix = f" • 🌐 URL"
+    elif need_search:
+        # Cari di internet berdasarkan isi pesan
+        search_results = await web_search(content, max_results=SEARCH_MAX_RESULTS)
+        if search_results:
+            enriched += f"\n\n{format_search_results(search_results, content)}"
+        mode_suffix = " • 🔍 Search"
 
     add_to_history(uid, "user", enriched)
 
     # Inject role context agar Yui tahu siapa yang bicara
     role_ctx = (
-        "[INFO] User ini adalah ADMIN. Yui boleh membantu mengatur server.\n"
+        f"[INFO] ADMIN bernama {nickname}. Yui boleh membantu mengatur server.\n"
         if admin else
-        "[INFO] User ini adalah MEMBER BIASA. Yui HANYA boleh ngobrol, tidak eksekusi perubahan server.\n"
+        f"[INFO] MEMBER bernama {nickname}. Yui HANYA boleh ngobrol.\n"
     )
     # Panggil AI
     try:
@@ -516,6 +865,7 @@ async def on_message(message: discord.Message) -> None:
             system=role_ctx + SYSTEM_CHAT,
             temperature=0.65 if is_task else 0.75,
             use_thinking=is_task,
+            images=images if images else None,
         )
     except httpx.ReadTimeout:
         await send_error(placeholder, "⏱️ Timeout", "Terlalu lama. Ganti `OLLAMA_MODEL=gemma4:e2b` di `.env` untuk model lebih ringan.")
@@ -545,7 +895,7 @@ async def on_message(message: discord.Message) -> None:
     yui_color = YUI_COLOR_TASK if (action or is_task) else YUI_COLOR
     embed = discord.Embed(description=display, color=yui_color)
     embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
-    embed.set_footer(text=f"Yui • {mode_label} • reply atau sebut nama Yui untuk lanjut~")
+    embed.set_footer(text=f"Yui • {mode_label}{mode_suffix} • reply atau sebut nama Yui untuk lanjut~")
 
     if action:
         if not admin:
@@ -613,7 +963,7 @@ async def ai_build(interaction: discord.Interaction, perintah: str, thinking: bo
     add_to_history(uid, "user", perintah)
 
     try:
-        ai_text = await ask_ollama(conversation_history[uid], system=system, temperature=0.6)
+        ai_text = await ask_ollama(conversation_history[uid], system=system, temperature=0.6, use_thinking=thinking)
     except Exception as e:
         await interaction.followup.send(f"❌ Error: `{e}`")
         return
@@ -724,9 +1074,11 @@ async def set_chat_channel(interaction: discord.Interaction):
     cid = interaction.channel_id
     if cid in chat_channel_ids:
         chat_channel_ids.discard(cid)
+        _save_json(CHAT_CHANNELS_FILE, chat_channel_ids)
         msg = f"🌸 Yui akan diam dulu di {interaction.channel.mention}~ Tapi kalau di-mention, Yui tetap muncul ya!"
     else:
         chat_channel_ids.add(cid)
+        _save_json(CHAT_CHANNELS_FILE, chat_channel_ids)
         msg = f"🌸 Yui sekarang aktif di {interaction.channel.mention}! Yui senang bisa menemani Onii-chan di sini~ ✨"
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -749,8 +1101,8 @@ async def ollama_status(interaction: discord.Interaction):
         embed.add_field(name="⚡ Fitur Aktif",
                         value="🧠 Thinking Mode\n📝 System Prompt\n📚 4K Context\n🔄 Auto-retry",
                         inline=False)
-        if not any("gemma4" in m for m in models):
-            embed.add_field(name="⚠️", value="```\nollama pull gemma4\n```", inline=False)
+        if not any(OLLAMA_MODEL in m for m in models):
+            embed.add_field(name="⚠️", value=f"```\nollama pull {OLLAMA_MODEL}\n```", inline=False)
     else:
         embed = discord.Embed(title="😢 Yui tidak bisa konek ke Ollama...",
                               description="Tolong jalankan dulu:\n```\nollama serve\n```\nYui akan menunggu~", color=0xF09595)
@@ -774,8 +1126,298 @@ async def server_info(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
+#  FITUR 1: Yui Ingat Member
+# ─────────────────────────────────────────────
+ANIME_QUOTES = [
+    ("Saya tidak menyerah! Itu bukan caraku!", "Naruto Uzumaki — Naruto"),
+    ("Manusia tidak bisa mendapatkan sesuatu tanpa mengorbankan sesuatu.", "Edward Elric — FMA"),
+    ("Seseorang yang tidak dapat mengorbankan apapun tidak dapat mengubah apapun.", "Armin Arlert — AOT"),
+    ("Kau tidak perlu sendirian lagi.", "Kirito — Sword Art Online"),
+    ("Aku tidak perlu masa depan. Aku hanya ingin saat ini yang tidak akan pernah berakhir.", "Isla — Plastic Memories"),
+    ("Bahkan jika kita lupa satu hari, kenangan kita tidak akan hilang.", "Yui — Sword Art Online"),
+    ("Keberanian bukan berarti tidak takut. Keberanian adalah melangkah meski kau takut.", "Erza Scarlet — Fairy Tail"),
+]
+
+
+@bot.tree.command(name="yui-ingat", description="Beritahu Yui nama panggilanmu", guild=_guild)
+@app_commands.describe(nickname="Nama panggilanmu", catatan="Catatan tambahan (opsional)")
+async def yui_ingat(interaction: discord.Interaction, nickname: str, catatan: str = ""):
+    uid_str = str(interaction.user.id)
+    user_memory[uid_str] = {"nickname": nickname, "notes": catatan}
+    _save_json(MEMORY_FILE, user_memory)
+    lines = [
+        "*Yui mengangguk semangat* Baik!",
+        f"Yui akan ingat kamu sebagai **{nickname}**~ \U0001f338",
+    ]
+    if catatan:
+        lines.append(f"Catatan: *{catatan}*")
+    emb = discord.Embed(description="\n".join(lines), color=YUI_COLOR)
+    emb.set_author(name="\U0001f338 Yui \u2014 Memory", icon_url=bot.user.display_avatar.url)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="yui-siapa-aku", description="Lihat apa yang Yui ingat tentang kamu", guild=_guild)
+async def yui_siapa_aku(interaction: discord.Interaction):
+    mem = user_memory.get(str(interaction.user.id), {})
+    if not mem:
+        await interaction.response.send_message(
+            "\U0001f338 Yui belum tahu nama panggilanmu~ Gunakan `/yui-ingat` ya!", ephemeral=True)
+        return
+    desc_lines = [
+        f"Nama panggilan: **{mem.get('nickname', '-')}**",
+        f"Catatan: *{mem.get('notes', '-')}*",
+    ]
+    emb = discord.Embed(title="\U0001f338 Yui ingat tentang kamu~",
+                        description="\n".join(desc_lines), color=YUI_COLOR)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="yui-lupakan", description="Hapus data yang Yui ingat tentang kamu", guild=_guild)
+async def yui_lupakan(interaction: discord.Interaction):
+    user_memory.pop(str(interaction.user.id), None)
+    _save_json(MEMORY_FILE, user_memory)
+    await interaction.response.send_message(
+        "\U0001f338 *Yui mengedipkan mata* Baik... Yui akan melupakan semuanya~ \U0001f97a",
+        ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  FITUR 2: Command Fun Yui
+# ─────────────────────────────────────────────
+@bot.tree.command(name="yui-quote", description="Minta Yui membagikan quote anime inspiratif", guild=_guild)
+async def yui_quote(interaction: discord.Interaction):
+    quote, source = random.choice(ANIME_QUOTES)
+    emb = discord.Embed(description=f"\u201c{quote}\u201d", color=YUI_COLOR)
+    emb.set_author(name="\U0001f338 Yui \u2014 Quote Anime", icon_url=bot.user.display_avatar.url)
+    emb.set_footer(text=f"\u2014 {source}")
+    await interaction.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="yui-roll", description="Lempar dadu! Yui akan hitung hasilnya~", guild=_guild)
+@app_commands.describe(sisi="Jumlah sisi dadu (default 6)", jumlah="Jumlah dadu (default 1, max 10)")
+async def yui_roll(interaction: discord.Interaction, sisi: int = 6, jumlah: int = 1):
+    sisi   = max(2, min(sisi, 100))
+    jumlah = max(1, min(jumlah, 10))
+    results = [random.randint(1, sisi) for _ in range(jumlah)]
+    total   = sum(results)
+    roll_str = " + ".join(str(r) for r in results)
+    desc = f"**{roll_str}**" + (f" = **{total}**" if jumlah > 1 else "")
+    emb = discord.Embed(title=f"\U0001f3b2 Yui melempar {jumlah}d{sisi}~!", description=desc, color=YUI_COLOR)
+    if total == jumlah:
+        emb.set_footer(text="Wah, nilai terkecil! Nasib ne~ \U0001f605")
+    elif total == sisi * jumlah:
+        emb.set_footer(text="SEMPURNA! Yui ikut senang~! \U0001f389")
+    else:
+        emb.set_footer(text="Semoga sesuai keinginanmu~ \U0001f338")
+    await interaction.response.send_message(embed=emb)
+
+
+@bot.tree.command(name="yui-pilih", description="Bingung pilih? Biar Yui yang putuskan~!", guild=_guild)
+@app_commands.describe(pilihan="Tulis pilihan dipisah koma, contoh: pizza, sushi, ramen")
+async def yui_pilih(interaction: discord.Interaction, pilihan: str):
+    options = [o.strip() for o in pilihan.split(",") if o.strip()]
+    if len(options) < 2:
+        await interaction.response.send_message(
+            "\U0001f338 Masukkan minimal 2 pilihan ya, dipisah koma~!", ephemeral=True)
+        return
+    chosen = random.choice(options)
+    desc_lines = [
+        "*Yui menutup mata dan menunjuk...*",
+        "",
+        f"\u2728 **{chosen}** \u2728",
+        "",
+        "*Yui yakin ini pilihan terbaik!* \U0001f338",
+    ]
+    emb = discord.Embed(description="\n".join(desc_lines), color=YUI_COLOR)
+    emb.set_author(name="\U0001f338 Yui \u2014 Pilihkan", icon_url=bot.user.display_avatar.url)
+    emb.set_footer(text=f"Dari {len(options)} pilihan: {', '.join(options)}")
+    await interaction.response.send_message(embed=emb)
+
+
+# ─────────────────────────────────────────────
+#  FITUR 3: Auto-moderasi — Kelola Kata Terlarang
+# ─────────────────────────────────────────────
+@bot.tree.command(name="yui-mod-add", description="Tambah kata terlarang (admin only)", guild=_guild)
+@app_commands.describe(kata="Kata atau frasa yang ingin dilarang")
+async def yui_mod_add(interaction: discord.Interaction, kata: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("\U0001f338 Maaf, hanya admin~", ephemeral=True)
+        return
+    banned_words.add(kata.lower().strip())
+    _save_json(BANNED_WORDS_FILE, banned_words)
+    await interaction.response.send_message(
+        f"\u2705 Kata `{kata}` ditambahkan. Yui akan menjaga server~ \U0001f338", ephemeral=True)
+
+
+@bot.tree.command(name="yui-mod-remove", description="Hapus kata dari daftar terlarang (admin only)", guild=_guild)
+@app_commands.describe(kata="Kata yang ingin dihapus")
+async def yui_mod_remove(interaction: discord.Interaction, kata: str):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("\U0001f338 Maaf, hanya admin~", ephemeral=True)
+        return
+    banned_words.discard(kata.lower().strip())
+    _save_json(BANNED_WORDS_FILE, banned_words)
+    await interaction.response.send_message(
+        f"\u2705 Kata `{kata}` dihapus dari daftar.", ephemeral=True)
+
+
+@bot.tree.command(name="yui-mod-list", description="Lihat semua kata terlarang (admin only)", guild=_guild)
+async def yui_mod_list(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("\U0001f338 Maaf, hanya admin~", ephemeral=True)
+        return
+    if not banned_words:
+        await interaction.response.send_message("\U0001f4cb Belum ada kata terlarang.", ephemeral=True)
+        return
+    words_str = "\n".join(f"\u2022 `{w}`" for w in sorted(banned_words))
+    emb = discord.Embed(title="\U0001f6e1\ufe0f Daftar Kata Terlarang",
+                        description=words_str, color=0xF09595)
+    emb.set_footer(text=f"Total: {len(banned_words)} kata")
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="yui-mod-warn", description="Lihat peringatan seorang member (admin only)", guild=_guild)
+@app_commands.describe(member="Member yang ingin dicek")
+async def yui_mod_warn(interaction: discord.Interaction, member: discord.Member):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("\U0001f338 Maaf, hanya admin~", ephemeral=True)
+        return
+    wc = warn_count.get(str(member.id), 0)
+    await interaction.response.send_message(
+        f"\U0001f4cb {member.mention} memiliki **{wc}** peringatan.", ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  FITUR 4: Statistik Server
+# ─────────────────────────────────────────────
+@bot.tree.command(name="yui-stats", description="Lihat statistik aktivitas server", guild=_guild)
+async def yui_stats(interaction: discord.Interaction):
+    gid   = interaction.guild.id
+    stats = msg_stats.get(gid)
+    emb   = discord.Embed(title=f"\U0001f4ca Statistik \u2014 {interaction.guild.name}", color=YUI_COLOR)
+    emb.set_author(name="\U0001f338 Yui \u2014 Stats", icon_url=bot.user.display_avatar.url)
+
+    if not stats or stats.get("total", 0) == 0:
+        emb.description = "*Yui belum punya data~ Data tersedia setelah ada aktivitas* \U0001f338"
+        await interaction.response.send_message(embed=emb)
+        return
+
+    total = stats["total"]
+    emb.add_field(name="\U0001f4ac Total Pesan", value=f"**{total:,}**", inline=True)
+    emb.add_field(name="\U0001f465 Members",    value=f"**{interaction.guild.member_count:,}**", inline=True)
+    emb.add_field(name="\U0001f4c2 Channels",   value=f"**{len(interaction.guild.text_channels)}**", inline=True)
+
+    top_ch = stats["ch"].most_common(5)
+    if top_ch:
+        ch_str = "\n".join(f"`#{n}` \u2014 {c:,} pesan" for n, c in top_ch)
+        emb.add_field(name="\U0001f525 Channel Paling Aktif", value=ch_str, inline=False)
+
+    top_usr = stats["usr"].most_common(5)
+    if top_usr:
+        usr_str = "\n".join(f"**{n}** \u2014 {c:,} pesan" for n, c in top_usr)
+        emb.add_field(name="\u2b50 Member Paling Aktif", value=usr_str, inline=False)
+
+    top_hr = stats["hr"].most_common(3)
+    if top_hr:
+        hr_str = " \u2022 ".join(f"Jam {h:02d}:00 ({c})" for h, c in top_hr)
+        emb.add_field(name="\u23f0 Waktu Paling Ramai", value=hr_str, inline=False)
+
+    emb.set_footer(text="Statistik sejak bot terakhir nyala \u2022 Yui selalu memantau~ \U0001f338")
+    await interaction.response.send_message(embed=emb)
+
+
+# ─────────────────────────────────────────────
+#  FITUR 5: Yui Search Internet
+# ─────────────────────────────────────────────
+SYSTEM_SEARCH = '<|think|>\nKamu adalah Yui dari SAO yang baru saja mencari informasi di internet.\nKamu diberikan hasil search yang sudah dirangkum.\nTugasmu: sampaikan informasinya dengan gaya Yui yang hangat dan natural.\n- Rangkum informasi penting dari hasil search\n- Sebutkan sumber (URL) jika relevan\n- Jika tidak ada hasil, akui dengan jujur\n- Gunakan Bahasa Indonesia\n- Tetap pakai gaya Yui: antusias, ramah, sesekali ekspresi imut\n'
+
+@bot.tree.command(name="yui-cari", description="Minta Yui mencari informasi di internet", guild=_guild)
+@app_commands.describe(query="Apa yang ingin dicari?")
+async def yui_cari(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    results = await web_search(query, max_results=5)
+    ctx     = format_search_results(results, query)
+    ok, _   = await ollama_online()
+    if not ok:
+        if not results:
+            await interaction.followup.send(f"🌸 Maaf, tidak ada hasil untuk `{query}`~ 😭")
+            return
+        emb = discord.Embed(title=f"🔍 Hasil: {query}", color=YUI_COLOR)
+        emb.set_author(name="🌸 Yui — Search", icon_url=bot.user.display_avatar.url)
+        for r in results[:5]:
+            emb.add_field(name=r["title"][:100], value=f"{r['snippet'][:150]}\n[Link]({r['url']})", inline=False)
+        await interaction.followup.send(embed=emb)
+        return
+    try:
+        ai_text = await ask_ollama(
+            [{"role": "user", "content": f"Tolong rangkum hasil search ini:\n\n{ctx}"}],
+            system=SYSTEM_SEARCH, temperature=0.7,
+        )
+    except Exception:
+        ai_text = ctx
+    emb = discord.Embed(description=ai_text[:3900] or "*Tidak ada hasil ne~*", color=YUI_COLOR)
+    emb.set_author(name="🌸 Yui — Search", icon_url=bot.user.display_avatar.url)
+    if results:
+        links = "\n".join(f"[{r['title'][:50]}]({r['url']})" for r in results[:3] if r.get("url"))
+        if links:
+            emb.add_field(name="🔗 Sumber", value=links, inline=False)
+    emb.set_footer(text=f"Query: {query} • DuckDuckGo • 🌸")
+    await interaction.followup.send(embed=emb)
+
+
+@bot.tree.command(name="yui-berita", description="Minta Yui mencari berita terbaru", guild=_guild)
+@app_commands.describe(topik="Topik berita yang ingin dicari")
+async def yui_berita(interaction: discord.Interaction, topik: str):
+    await interaction.response.defer()
+    results = await news_search(topik, max_results=5)
+    if not results:
+        await interaction.followup.send(
+            f"🌸 Maaf, Yui tidak menemukan berita tentang `{topik}`~ 😭")
+        return
+    emb = discord.Embed(title=f"📰 Berita: {topik}", color=0xAFA9EC)
+    emb.set_author(name="🌸 Yui — Berita", icon_url=bot.user.display_avatar.url)
+    for r in results[:5]:
+        snip = r["snippet"][:120] + ("..." if len(r["snippet"]) > 120 else "")
+        url_p = f"\n[Baca]({r['url']})" if r.get("url") else ""
+        emb.add_field(name=r["title"][:80] or "Berita", value=snip + url_p, inline=False)
+    emb.set_footer(text="DuckDuckGo News • 🌸 Yui selalu update untukmu~")
+    await interaction.followup.send(embed=emb)
+
+
+@bot.tree.command(name="yui-tanya-web", description="Tanya Yui sesuatu, Yui akan search dulu sebelum menjawab", guild=_guild)
+@app_commands.describe(pertanyaan="Pertanyaanmu untuk Yui")
+async def yui_tanya_web(interaction: discord.Interaction, pertanyaan: str):
+    await interaction.response.defer()
+    results  = await web_search(pertanyaan, max_results=4)
+    ctx      = format_search_results(results, pertanyaan)
+    ok, _    = await ollama_online()
+    if not ok:
+        await interaction.followup.send("🌸 Maaf Onii-chan, Ollama offline~")
+        return
+    uid      = interaction.user.id
+    nickname = user_memory.get(str(uid), {}).get("nickname", interaction.user.display_name)
+    prompt   = f"Pertanyaan dari {nickname}: {pertanyaan}\n\nHasil search:\n{ctx}\n\nJawab dengan gaya Yui."
+    try:
+        ai_text = await ask_ollama(
+            [{"role": "user", "content": prompt}],
+            system=SYSTEM_SEARCH, temperature=0.7,
+        )
+    except Exception:
+        ai_text = ctx[:1000]
+    emb = discord.Embed(description=ai_text[:3900], color=YUI_COLOR)
+    emb.set_author(name="🌸 Yui — Tanya Web", icon_url=bot.user.display_avatar.url)
+    if results:
+        links = "\n".join(f"[{r['title'][:50]}]({r['url']})" for r in results[:3] if r.get("url"))
+        if links:
+            emb.add_field(name="🔗 Referensi", value=links, inline=False)
+    emb.set_footer(text="🌸 Yui selalu mencari yang terbaik untukmu~")
+    await interaction.followup.send(embed=emb)
+
+
+# ─────────────────────────────────────────────
 #  Error Handler
 # ─────────────────────────────────────────────
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     msg = ("❌ Kamu tidak punya izin untuk command ini."
