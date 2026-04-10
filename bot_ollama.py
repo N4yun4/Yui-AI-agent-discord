@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import collections
+import datetime
 import html
 import json
 import os
@@ -1703,6 +1704,362 @@ async def yui_tanya_web(interaction: discord.Interaction, pertanyaan: str):
             emb.add_field(name="🔗 Referensi", value=links, inline=False)
     emb.set_footer(text="🌸 Yui selalu mencari yang terbaik untukmu~")
     await interaction.followup.send(embed=emb)
+
+
+
+# ═══════════════════════════════════════════════
+#  FITUR MENENGAH
+# ═══════════════════════════════════════════════
+
+# ─────────────────────────────────────────────
+#  1. POLL — Voting dengan Emoji Reaction
+# ─────────────────────────────────────────────
+POLL_NUMBER_EMOJIS = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+@bot.tree.command(name="yui-poll",
+                  description="Buat poll voting dengan emoji reaction",
+                  guild=_guild)
+@app_commands.describe(
+    pertanyaan="Pertanyaan poll",
+    pilihan="Pilihan-pilihan dipisah dengan tanda | contoh: Setuju|Tidak Setuju|Abstain",
+    durasi="Durasi poll dalam menit (0 = tidak ada batas waktu, default 5)",
+)
+async def yui_poll(
+    interaction: discord.Interaction,
+    pertanyaan: str,
+    pilihan: str,
+    durasi: int = 5,
+):
+    options = [o.strip() for o in pilihan.split("|") if o.strip()]
+    if len(options) < 2:
+        await interaction.response.send_message(
+            "🌸 Minimal 2 pilihan ya Onii-chan~ Pisahkan dengan tanda `|`", ephemeral=True)
+        return
+    if len(options) > 10:
+        await interaction.response.send_message(
+            "🌸 Maksimal 10 pilihan saja ne~", ephemeral=True)
+        return
+
+    desc_lines = [f"**{pertanyaan}**\n"]
+    for i, opt in enumerate(options):
+        desc_lines.append(f"{POLL_NUMBER_EMOJIS[i]} {opt}")
+
+    footer_text = (
+        f"⏳ Poll berakhir dalam {durasi} menit • oleh {interaction.user.display_name}" if durasi > 0
+        else f"🗳️ Poll tanpa batas waktu • oleh {interaction.user.display_name}"
+    )
+    embed = discord.Embed(
+        title="🗳️ Yui mengadakan Poll~!",
+        description="\n".join(desc_lines),
+        color=YUI_COLOR_TASK,
+    )
+    embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+    embed.set_footer(text=footer_text)
+
+    await interaction.response.send_message(embed=embed)
+    poll_msg = await interaction.original_response()
+
+    # Tambah reaction untuk tiap pilihan
+    for i in range(len(options)):
+        await poll_msg.add_reaction(POLL_NUMBER_EMOJIS[i])
+
+    # Jika ada durasi, tunggu lalu tampilkan hasil
+    if durasi > 0:
+        async def show_results():
+            await asyncio.sleep(durasi * 60)
+            try:
+                poll_msg_updated = await interaction.channel.fetch_message(poll_msg.id)
+                result_lines = [f"**Hasil Poll: {pertanyaan}**\n"]
+                total_votes = 0
+                vote_counts = []
+                for i, opt in enumerate(options):
+                    count = 0
+                    for r in poll_msg_updated.reactions:
+                        if str(r.emoji) == POLL_NUMBER_EMOJIS[i]:
+                            count = max(0, r.count - 1)  # kurangi 1 (reaksi bot sendiri)
+                            break
+                    vote_counts.append((opt, count))
+                    total_votes += count
+
+                vote_counts.sort(key=lambda x: x[1], reverse=True)
+                for opt, count in vote_counts:
+                    pct = (count / total_votes * 100) if total_votes > 0 else 0
+                    bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+                    result_lines.append(f"{bar} **{opt}** — {count} suara ({pct:.0f}%)")
+
+                winner = vote_counts[0][0] if vote_counts and vote_counts[0][1] > 0 else "Tidak ada"
+                result_embed = discord.Embed(
+                    title="📊 Hasil Poll Sudah Keluar~!",
+                    description="\n".join(result_lines),
+                    color=discord.Color.green(),
+                )
+                result_embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+                result_embed.add_field(name="🏆 Pemenang", value=winner, inline=True)
+                result_embed.add_field(name="🗳️ Total Suara", value=str(total_votes), inline=True)
+                result_embed.set_footer(text="🌸 Terima kasih sudah berpartisipasi~!")
+                await interaction.channel.send(embed=result_embed)
+            except Exception:
+                pass
+
+        asyncio.create_task(show_results())
+
+
+# ─────────────────────────────────────────────
+#  2. SCHEDULED MESSAGE — Pesan Terjadwal
+# ─────────────────────────────────────────────
+_scheduled_tasks: dict[str, asyncio.Task] = {}  # task_id → Task
+
+@bot.tree.command(name="yui-jadwal",
+                  description="Jadwalkan Yui mengirim pesan di waktu tertentu",
+                  guild=_guild)
+@app_commands.describe(
+    menit="Kirim pesan setelah berapa menit dari sekarang",
+    pesan="Pesan yang akan dikirim Yui",
+    channel="Channel tujuan (kosongkan = channel ini)",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def yui_jadwal(
+    interaction: discord.Interaction,
+    menit: int,
+    pesan: str,
+    channel: discord.TextChannel | None = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+    if menit < 1 or menit > 1440:
+        await interaction.response.send_message(
+            "🌸 Durasi harus antara 1 hingga 1440 menit (24 jam) ya~", ephemeral=True)
+        return
+
+    target = channel or interaction.channel
+    task_id = f"{interaction.user.id}_{interaction.id}"
+
+    async def _send_later():
+        await asyncio.sleep(menit * 60)
+        try:
+            sched_embed = discord.Embed(
+                description=pesan,
+                color=YUI_COLOR,
+            )
+            sched_embed.set_author(name=f"🌸 {bot.user.display_name} — Pesan Terjadwal",
+                                   icon_url=bot.user.display_avatar.url)
+            sched_embed.set_footer(text=f"Dijadwalkan oleh {interaction.user.display_name} • 🌸")
+            await target.send(embed=sched_embed)
+        except Exception:
+            pass
+        finally:
+            _scheduled_tasks.pop(task_id, None)
+
+    task = asyncio.create_task(_send_later())
+    _scheduled_tasks[task_id] = task
+
+    confirm_embed = discord.Embed(
+        title="⏰ Pesan Terjadwal!",
+        description=f"Yui akan mengirim pesan di {target.mention} dalam **{menit} menit** ya~\n\n>>> {pesan[:200]}",
+        color=YUI_COLOR_TASK,
+    )
+    confirm_embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+    confirm_embed.set_footer(text=f"Dijadwalkan oleh {interaction.user.display_name}")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  3. PURGE — Hapus Banyak Pesan Sekaligus
+# ─────────────────────────────────────────────
+@bot.tree.command(name="yui-purge",
+                  description="Hapus X pesan terakhir di channel ini",
+                  guild=_guild)
+@app_commands.describe(
+    jumlah="Jumlah pesan yang ingin dihapus (1–100)",
+    user="Hanya hapus pesan dari user tertentu (opsional)",
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def yui_purge(
+    interaction: discord.Interaction,
+    jumlah: int,
+    user: discord.Member | None = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+    jumlah = max(1, min(jumlah, 100))
+
+    await interaction.response.defer(ephemeral=True)
+
+    def check(msg: discord.Message) -> bool:
+        if user:
+            return msg.author == user
+        return True
+
+    try:
+        deleted = await interaction.channel.purge(limit=jumlah, check=check)
+        who = f" dari **{user.display_name}**" if user else ""
+        await interaction.followup.send(
+            f"🌸 Yui sudah menghapus **{len(deleted)}** pesan{who}~ ✨",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ Yui tidak punya izin **Manage Messages** di channel ini~", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Gagal hapus pesan: `{e}`", ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  4. BACKUP — Simpan Struktur Channel ke JSON
+# ─────────────────────────────────────────────
+BACKUP_DIR = pathlib.Path("yui_backups")
+
+@bot.tree.command(name="yui-backup",
+                  description="Simpan struktur channel & kategori server ke file backup JSON",
+                  guild=_guild)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yui_backup(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    backup: dict = {
+        "server_name": guild.name,
+        "guild_id": guild.id,
+        "backup_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "backed_up_by": interaction.user.display_name,
+        "categories": [],
+        "no_category": [],
+    }
+
+    for cat in guild.categories:
+        cat_data = {"name": cat.name, "position": cat.position, "channels": []}
+        for ch in cat.channels:
+            ch_data = {
+                "name": ch.name,
+                "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text",
+                "position": ch.position,
+            }
+            if isinstance(ch, discord.TextChannel) and ch.topic:
+                ch_data["topic"] = ch.topic
+            cat_data["channels"].append(ch_data)
+        backup["categories"].append(cat_data)
+
+    for ch in guild.channels:
+        if ch.category is None and not isinstance(ch, discord.CategoryChannel):
+            backup["no_category"].append({
+                "name": ch.name,
+                "type": "voice" if isinstance(ch, discord.VoiceChannel) else "text",
+            })
+
+    BACKUP_DIR.mkdir(exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = BACKUP_DIR / f"backup_{guild.id}_{ts}.json"
+    filename.write_text(json.dumps(backup, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ch_total   = sum(len(c["channels"]) for c in backup["categories"]) + len(backup["no_category"])
+    cat_total  = len(backup["categories"])
+
+    embed = discord.Embed(
+        title="💾 Backup Server Berhasil~!",
+        description=(
+            f"Yui sudah menyimpan struktur server **{guild.name}** ke file backup!\n\n"
+            f"📂 **{cat_total}** kategori\n"
+            f"💬 **{ch_total}** channel\n"
+            f"📁 File: `{filename.name}`"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+    embed.set_footer(text=f"Backup oleh {interaction.user.display_name} • {ts}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="yui-restore",
+                  description="Tampilkan daftar backup yang tersedia (restore struktur channel)",
+                  guild=_guild)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def yui_restore_list(interaction: discord.Interaction):
+    """Tampilkan daftar file backup yang tersedia."""
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+
+    BACKUP_DIR.mkdir(exist_ok=True)
+    files = sorted(BACKUP_DIR.glob(f"backup_{interaction.guild.id}_*.json"), reverse=True)
+    if not files:
+        await interaction.response.send_message(
+            "🌸 Belum ada backup untuk server ini~ Gunakan `/yui-backup` dulu ya!", ephemeral=True)
+        return
+
+    lines = []
+    for i, f in enumerate(files[:10], 1):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            ts   = data.get("backup_time", "?")[:19].replace("T", " ")
+            by   = data.get("backed_up_by", "?")
+            cats = len(data.get("categories", []))
+            chs  = sum(len(c["channels"]) for c in data.get("categories", []))
+            lines.append(f"`{i}.` **{f.name}**\n    📅 {ts} • oleh {by} • {cats} kat / {chs} ch")
+        except Exception:
+            lines.append(f"`{i}.` `{f.name}` *(tidak bisa dibaca)*")
+
+    embed = discord.Embed(
+        title="💾 Daftar Backup Server",
+        description="\n\n".join(lines),
+        color=YUI_COLOR_TASK,
+    )
+    embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
+    embed.set_footer(text="Untuk restore, kirim file backup ke admin secara manual dan gunakan /ai-build~")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  5. SLOWMODE — Atur Slowmode Channel
+# ─────────────────────────────────────────────
+@bot.tree.command(name="yui-slowmode",
+                  description="Atur slowmode di channel ini (0 = matikan slowmode)",
+                  guild=_guild)
+@app_commands.describe(
+    detik="Cooldown slowmode dalam detik (0–21600). 0 = matikan.",
+    channel="Channel target (kosongkan = channel ini)",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def yui_slowmode(
+    interaction: discord.Interaction,
+    detik: int,
+    channel: discord.TextChannel | None = None,
+):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message(
+            "🌸 Maaf, command ini hanya untuk admin~", ephemeral=True)
+        return
+
+    detik = max(0, min(detik, 21600))  # Discord max: 6 jam
+    target = channel or interaction.channel
+
+    try:
+        await target.edit(slowmode_delay=detik)
+        if detik == 0:
+            msg = f"✅ Slowmode di {target.mention} sudah **dimatikan** oleh Yui~ 🌸"
+        else:
+            # Format durasi
+            if detik < 60:
+                dur = f"{detik} detik"
+            elif detik < 3600:
+                dur = f"{detik // 60} menit"
+            else:
+                dur = f"{detik // 3600} jam {(detik % 3600) // 60} menit"
+            msg = f"🐢 Slowmode di {target.mention} diset ke **{dur}** oleh Yui~ ✨"
+        await interaction.response.send_message(msg, ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ Yui tidak punya izin **Manage Channels** di channel tersebut~", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ Gagal atur slowmode: `{e}`", ephemeral=True)
 
 
 # ─────────────────────────────────────────────
