@@ -1021,12 +1021,26 @@ async def on_message(message: discord.Message) -> None:
 
     add_to_history(uid, "user", enriched)
 
+    # Inject waktu real-time → Yui selalu tahu jam & tanggal saat ini
+    now_utc  = datetime.datetime.now(datetime.timezone.utc)
+    now_wib  = now_utc + datetime.timedelta(hours=7)   # WIB (UTC+7)
+    now_wita = now_utc + datetime.timedelta(hours=8)   # WITA (UTC+8)
+    now_wit  = now_utc + datetime.timedelta(hours=9)   # WIT (UTC+9)
+    _DAY_ID  = ["Senin","Selasa","Rabu","Kamis","Jumat","Sabtu","Minggu"]
+    time_ctx = (
+        f"[WAKTU SEKARANG]\n"
+        f"WIB  (UTC+7): {now_wib.strftime('%A')} ({_DAY_ID[now_wib.weekday()]}), "
+        f"{now_wib.strftime('%d %B %Y')} — {now_wib.strftime('%H:%M:%S')} WIB\n"
+        f"WITA (UTC+8): {now_wita.strftime('%H:%M')} WITA  |  "
+        f"WIT  (UTC+9): {now_wit.strftime('%H:%M')} WIT\n"
+    )
+
     # Inject role context agar Yui tahu siapa yang bicara
     role_ctx = (
         f"[INFO] ADMIN bernama {nickname}. Yui boleh membantu mengatur server.\n"
         if admin else
         f"[INFO] MEMBER bernama {nickname}. Yui HANYA boleh ngobrol.\n"
-    )
+    ) + time_ctx
     # Panggil AI
     try:
         ai_text = await ask_ollama(
