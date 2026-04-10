@@ -799,6 +799,25 @@ async def send_error(target, title: str, desc: str) -> None:
     await target.edit(embed=embed)
 
 
+def _split_text(text: str, limit: int = 4096) -> list[str]:
+    """Pecah teks panjang menjadi beberapa chunk ≤ limit karakter.
+    Mencoba memotong di batas baris baru agar teks tidak terpotong di tengah kalimat."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Cari baris baru terakhir sebelum batas limit
+        cut = text.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = limit  # tidak ada baris baru, potong tepat di limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
 # ─────────────────────────────────────────────
 #  Events
 # ─────────────────────────────────────────────
@@ -1073,13 +1092,18 @@ async def on_message(message: discord.Message) -> None:
     add_to_history(uid, "assistant", ai_text)
 
     actions = extract_all_json(ai_text)  # ambil SEMUA JSON action
-    display = strip_json_block(ai_text)[:1900] or "..."
+    full_display = strip_json_block(ai_text) or "..."
+    chunks = _split_text(full_display, limit=4096)
 
     has_action = bool(actions)
     yui_color = YUI_COLOR_TASK if (has_action or is_task) else YUI_COLOR
-    embed = discord.Embed(description=display, color=yui_color)
+
+    # ── Buat embed untuk chunk pertama ──
+    embed = discord.Embed(description=chunks[0], color=yui_color)
     embed.set_author(name=f"🌸 {bot.user.display_name}", icon_url=bot.user.display_avatar.url)
-    embed.set_footer(text=f"Yui • {mode_label}{mode_suffix} • reply atau sebut nama Yui untuk lanjut~")
+    footer_text = f"Yui • {mode_label}{mode_suffix} • reply atau sebut nama Yui untuk lanjut~"
+    if len(chunks) == 1:
+        embed.set_footer(text=footer_text)
 
     if actions:
         if not admin:
@@ -1109,8 +1133,15 @@ async def on_message(message: discord.Message) -> None:
             embed.add_field(name=f"🌸 Yui — {len(actions)} aksi selesai", value=result_text[:1020], inline=False)
             embed.color = discord.Color.green()
 
-
     await placeholder.edit(embed=embed)
+
+    # ── Kirim chunk-chunk berikutnya sebagai pesan lanjutan ──
+    for i, chunk in enumerate(chunks[1:], start=2):
+        cont_embed = discord.Embed(description=chunk, color=yui_color)
+        is_last = (i == len(chunks))
+        if is_last:
+            cont_embed.set_footer(text=footer_text)
+        await message.channel.send(embed=cont_embed)
 
 
 # ─────────────────────────────────────────────
